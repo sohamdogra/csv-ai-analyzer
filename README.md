@@ -2,10 +2,8 @@
 
 An AI-powered CSV data analysis tool built with **React** and the **Anthropic Claude API**. Upload any CSV file and get instant AI-generated insights, visualizations, and summaries.
 
-## 🚀 Live Demo
-[👉 View Live App](#) <!-- Replace with your Vercel URL -->
 
-## ✨ Features
+##  Features
 - **Drag & drop** CSV file upload
 - **AI-powered analysis** via Claude API (claude-sonnet-4)
 - **Auto-generated insights** — summary, key findings, anomalies
@@ -13,7 +11,7 @@ An AI-powered CSV data analysis tool built with **React** and the **Anthropic Cl
 - **Row/column stats** at a glance
 - Works with any CSV dataset
 
-## 🛠️ Tech Stack
+## Tech Stack
 - React 18 + Vite
 - Recharts (data visualization)
 - Anthropic Claude API (`claude-sonnet-4-20250514`)
