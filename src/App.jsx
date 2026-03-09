@@ -1,46 +1,96 @@
 import { useState, useRef, useCallback } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 
-const CLAUDE_MODEL = "claude-sonnet-4-20250514";
-
-async function analyzeWithClaude(csvText, filename, apiKey) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: 1000,
-      messages: [{
-        role: "user",
-        content: `You are a data scientist. Analyze this CSV data from "${filename}" and respond ONLY with a valid JSON object (no markdown, no backticks) with this exact structure:
-{
-  "summary": "2-3 sentence plain English summary of what this dataset is about and key findings",
-  "rowCount": <number>,
-  "columnCount": <number>,
-  "insights": ["insight 1", "insight 2", "insight 3"],
-  "topColumn": "<name of most interesting numeric column>",
-  "chartData": [{"label": "...", "value": <number>}, ...] (max 8 items from the most interesting column or category)
+// Pure JS CSV parser
+function parseCSV(text) {
+  const lines = text.trim().split("\n");
+  const headers = lines[0].split(",").map(h => h.trim().replace(/"/g, ""));
+  const rows = lines.slice(1).map(line => {
+    const vals = line.split(",").map(v => v.trim().replace(/"/g, ""));
+    return Object.fromEntries(headers.map((h, i) => [h, vals[i] ?? ""]));
+  });
+  return { headers, rows };
 }
 
-CSV Data:
-${csvText.slice(0, 4000)}`
-      }]
-    })
+// Statistical analysis
+function analyzeCSV(text, filename) {
+  const { headers, rows } = parseCSV(text);
+
+  const numericCols = headers.filter(h => {
+    const vals = rows.map(r => parseFloat(r[h])).filter(v => !isNaN(v));
+    return vals.length > rows.length * 0.5;
   });
 
-  if (!response.ok) {
-    const err = await response.json();
-    throw new Error(err.error?.message || "API error");
+  const categoricalCols = headers.filter(h => !numericCols.includes(h));
+
+  const colStats = {};
+  for (const col of numericCols) {
+    const vals = rows.map(r => parseFloat(r[col])).filter(v => !isNaN(v)).sort((a, b) => a - b);
+    const sum = vals.reduce((a, b) => a + b, 0);
+    const mean = sum / vals.length;
+    const median = vals[Math.floor(vals.length / 2)];
+    const min = vals[0];
+    const max = vals[vals.length - 1];
+    const variance = vals.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / vals.length;
+    const stddev = Math.sqrt(variance);
+    colStats[col] = { mean, median, min, max, stddev, count: vals.length };
   }
 
-  const data = await response.json();
-  const text = data.content.map(b => b.text || "").join("");
-  return JSON.parse(text.replace(/```json|```/g, "").trim());
+  const topCol = numericCols.sort((a, b) => {
+    const cv = (c) => colStats[c].stddev / (Math.abs(colStats[c].mean) || 1);
+    return cv(b) - cv(a);
+  })[0];
+
+  let chartData = [];
+  if (topCol) {
+    if (categoricalCols.length > 0) {
+      const groupCol = categoricalCols[0];
+      const groups = {};
+      rows.forEach(r => {
+        const key = r[groupCol]?.slice(0, 12) || "Other";
+        const val = parseFloat(r[topCol]);
+        if (!isNaN(val)) {
+          if (!groups[key]) groups[key] = [];
+          groups[key].push(val);
+        }
+      });
+      chartData = Object.entries(groups)
+        .map(([label, vals]) => ({ label, value: parseFloat((vals.reduce((a,b) => a+b,0) / vals.length).toFixed(2)) }))
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 8);
+    } else {
+      const vals = rows.map(r => parseFloat(r[topCol])).filter(v => !isNaN(v));
+      const min = Math.min(...vals), max = Math.max(...vals);
+      const bucketSize = (max - min) / 6;
+      chartData = Array.from({ length: 6 }, (_, i) => ({
+        label: `${(min + i * bucketSize).toFixed(1)}`,
+        value: vals.filter(v => v >= min + i * bucketSize && v < min + (i + 1) * bucketSize).length
+      }));
+    }
+  }
+
+  const insights = [];
+  if (numericCols.length > 0 && topCol) {
+    const s = colStats[topCol];
+    insights.push(`"${topCol}" ranges from ${s.min.toLocaleString()} to ${s.max.toLocaleString()}, with a mean of ${s.mean.toFixed(2)} and std dev of ${s.stddev.toFixed(2)}.`);
+  }
+  if (numericCols.length > 1) {
+    const second = numericCols[1];
+    const s = colStats[second];
+    insights.push(`"${second}" has a median of ${s.median.toLocaleString()} across ${s.count} valid entries.`);
+  }
+  if (categoricalCols.length > 0) {
+    const col = categoricalCols[0];
+    const unique = new Set(rows.map(r => r[col])).size;
+    insights.push(`"${col}" has ${unique} unique values across ${rows.length} rows.`);
+  } else {
+    const nullCount = rows.filter(r => headers.some(h => r[h] === "" || r[h] == null)).length;
+    insights.push(`${nullCount} rows contain at least one missing value (${((nullCount / rows.length) * 100).toFixed(1)}% of dataset).`);
+  }
+
+  const summary = `This dataset "${filename}" contains ${rows.length} rows and ${headers.length} columns — ${numericCols.length} numeric and ${categoricalCols.length} categorical. ${topCol ? `The most variable column is "${topCol}" with values ranging from ${colStats[topCol].min} to ${colStats[topCol].max}.` : ""}`;
+
+  return { summary, rowCount: rows.length, columnCount: headers.length, insights, topColumn: topCol || categoricalCols[0] || headers[0], chartData };
 }
 
 export default function CSVAnalyzer() {
@@ -50,8 +100,6 @@ export default function CSVAnalyzer() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
-  const [apiKey, setApiKey] = useState("");
-  const [showKey, setShowKey] = useState(false);
   const fileRef = useRef();
 
   const handleFile = useCallback((f) => {
@@ -66,10 +114,10 @@ export default function CSVAnalyzer() {
 
   const analyze = async () => {
     if (!csvText) return;
-    if (!apiKey.trim()) { setError("Please enter your Anthropic API key."); return; }
     setLoading(true); setError("");
     try {
-      const result = await analyzeWithClaude(csvText, file.name, apiKey.trim());
+      await new Promise(r => setTimeout(r, 600));
+      const result = analyzeCSV(csvText, file.name);
       setAnalysis(result);
     } catch (e) {
       setError("Analysis failed: " + e.message);
@@ -80,12 +128,7 @@ export default function CSVAnalyzer() {
   const reset = () => { setFile(null); setCsvText(""); setAnalysis(null); setError(""); };
 
   return (
-    <div style={{
-      minHeight: "100vh",
-      background: "#0a0a0f",
-      fontFamily: "'Courier New', monospace",
-      color: "#e2e8f0",
-    }}>
+    <div style={{ minHeight: "100vh", background: "#0a0a0f", fontFamily: "'Courier New', monospace", color: "#e2e8f0" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
         * { box-sizing: border-box; }
@@ -125,63 +168,30 @@ export default function CSVAnalyzer() {
         @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
         .fade-in { animation: fadeIn 0.5s ease forwards; }
         @keyframes fadeIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
-        .api-input {
-          background: rgba(0,255,136,0.04); border: 1px solid rgba(0,255,136,0.2);
-          color: #e2e8f0; padding: 10px 14px; font-family: 'Space Mono', monospace;
-          font-size: 12px; width: 100%; outline: none; border-radius: 2px;
-        }
-        .api-input:focus { border-color: #00ff88; }
-        .api-input::placeholder { color: rgba(255,255,255,0.2); }
       `}</style>
 
       <div className="scan-line" />
-
       <div style={{ position: "relative", zIndex: 1, maxWidth: 860, margin: "0 auto", padding: "48px 24px" }}>
 
-        {/* Header */}
         <div style={{ marginBottom: 48 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
             <span style={{ color: "#00ff88", fontFamily: "'Space Mono'", fontSize: 12, letterSpacing: 3 }}>SYS://TOOL</span>
             <div style={{ height: 1, flex: 1, background: "rgba(0,255,136,0.2)" }} />
-            <span style={{ color: "rgba(0,255,136,0.4)", fontSize: 11 }}>v1.0.0</span>
+            <span style={{ color: "rgba(0,255,136,0.4)", fontSize: 11 }}>v2.0.0</span>
           </div>
           <h1 className="glow" style={{
             fontFamily: "'Syne', sans-serif", fontSize: "clamp(32px, 6vw, 56px)",
             fontWeight: 800, margin: 0, lineHeight: 1,
             background: "linear-gradient(135deg, #00ff88 0%, #00d4ff 100%)",
             WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent"
-          }}>
-            CSV ANALYZER
-          </h1>
+          }}>CSV ANALYZER</h1>
           <p style={{ color: "rgba(255,255,255,0.4)", fontSize: 13, marginTop: 12, fontFamily: "'Space Mono'" }}>
-            &gt; AI-powered data insights via Claude API
+            &gt; Instant statistical analysis — no sign up, no API key
           </p>
         </div>
 
         {!analysis ? (
           <div className="card" style={{ padding: 32 }}>
-
-            {/* API Key Input */}
-            <div style={{ marginBottom: 24 }}>
-              <div style={{ fontSize: 10, letterSpacing: 3, color: "#00ff88", marginBottom: 10 }}>ANTHROPIC API KEY</div>
-              <div style={{ display: "flex", gap: 8 }}>
-                <input
-                  className="api-input"
-                  type={showKey ? "text" : "password"}
-                  placeholder="sk-ant-..."
-                  value={apiKey}
-                  onChange={e => setApiKey(e.target.value)}
-                />
-                <button className="btn-ghost" onClick={() => setShowKey(p => !p)} style={{ whiteSpace: "nowrap" }}>
-                  {showKey ? "HIDE" : "SHOW"}
-                </button>
-              </div>
-              <div style={{ fontSize: 10, color: "rgba(255,255,255,0.25)", marginTop: 6 }}>
-                Get your key at console.anthropic.com · Never stored or sent anywhere except Anthropic
-              </div>
-            </div>
-
-            {/* Drop Zone */}
             <div
               className={`drop-zone ${dragging ? "active" : ""}`}
               onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
@@ -194,9 +204,7 @@ export default function CSVAnalyzer() {
               {file ? (
                 <div>
                   <div style={{ color: "#00ff88", fontWeight: 700, fontSize: 14 }}>✓ {file.name}</div>
-                  <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 11, marginTop: 4 }}>
-                    {(file.size / 1024).toFixed(1)} KB · Click to change
-                  </div>
+                  <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 11, marginTop: 4 }}>{(file.size / 1024).toFixed(1)} KB · Click to change</div>
                 </div>
               ) : (
                 <div>
@@ -206,11 +214,7 @@ export default function CSVAnalyzer() {
               )}
             </div>
 
-            {error && (
-              <div style={{ marginTop: 16, color: "#ff4466", fontSize: 12, fontFamily: "'Space Mono'" }}>
-                &gt; ERR: {error}
-              </div>
-            )}
+            {error && <div style={{ marginTop: 16, color: "#ff4466", fontSize: 12 }}>&gt; ERR: {error}</div>}
 
             <div style={{ marginTop: 24, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
               <button className="btn" onClick={analyze} disabled={!file || loading}>
@@ -218,12 +222,6 @@ export default function CSVAnalyzer() {
               </button>
               {file && <button className="btn-ghost" onClick={reset}>CLEAR</button>}
             </div>
-
-            {loading && (
-              <div style={{ marginTop: 20, color: "rgba(0,255,136,0.6)", fontSize: 12, fontFamily: "'Space Mono'" }}>
-                &gt; Sending data to Claude API<span className="pulse">...</span>
-              </div>
-            )}
           </div>
         ) : (
           <div className="fade-in">
@@ -251,13 +249,10 @@ export default function CSVAnalyzer() {
                   DATA VISUALIZATION — {analysis.topColumn?.toUpperCase()}
                 </div>
                 <ResponsiveContainer width="100%" height={200}>
-                  <BarChart data={analysis.chartData} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                  <BarChart data={analysis.chartData}>
                     <XAxis dataKey="label" tick={{ fill: "rgba(255,255,255,0.3)", fontSize: 10 }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fill: "rgba(255,255,255,0.3)", fontSize: 10 }} axisLine={false} tickLine={false} />
-                    <Tooltip
-                      contentStyle={{ background: "#0a0a0f", border: "1px solid rgba(0,255,136,0.3)", borderRadius: 2, fontFamily: "'Space Mono'", fontSize: 11 }}
-                      labelStyle={{ color: "#00ff88" }} itemStyle={{ color: "#fff" }}
-                    />
+                    <Tooltip contentStyle={{ background: "#0a0a0f", border: "1px solid rgba(0,255,136,0.3)", fontFamily: "'Space Mono'", fontSize: 11 }} labelStyle={{ color: "#00ff88" }} itemStyle={{ color: "#fff" }} />
                     <Bar dataKey="value" fill="#00ff88" radius={[2, 2, 0, 0]} opacity={0.85} />
                   </BarChart>
                 </ResponsiveContainer>
@@ -281,8 +276,8 @@ export default function CSVAnalyzer() {
         )}
 
         <div style={{ marginTop: 48, paddingTop: 24, borderTop: "1px solid rgba(255,255,255,0.06)", display: "flex", justifyContent: "space-between" }}>
-          <span style={{ fontSize: 10, color: "rgba(255,255,255,0.2)", letterSpacing: 2 }}>BUILT WITH CLAUDE API</span>
-          <span style={{ fontSize: 10, color: "rgba(0,255,136,0.3)", letterSpacing: 1 }}>anthropic.com</span>
+          <span style={{ fontSize: 10, color: "rgba(255,255,255,0.2)", letterSpacing: 2 }}>STATISTICAL ANALYSIS ENGINE</span>
+          <span style={{ fontSize: 10, color: "rgba(0,255,136,0.3)" }}>100% client-side</span>
         </div>
       </div>
     </div>
